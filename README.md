@@ -1,6 +1,3 @@
-# Creating the README.md file with the provided content
-
-readme_content = """
 # Real-Time Twilio Outbound AI Voice Assistant
 
 ## Overview
