@@ -100,14 +100,32 @@ async def handle_web_page(websocket: WebSocket):
                     stream_sid = response_packet["streamSid"]
                     base64_audio = response_packet["payload"]
 
-                    # Decode the Base64 payload to raw audio
+                    # Decode the Base64 payload to raw PCM audio
                     raw_audio = base64.b64decode(base64_audio)
 
+                    # Resample the audio to 8000 Hz
+                    try:
+                        resampled_audio = audioop.ratecv(raw_audio, 2, 1, 44100, 8000, None)[0]
+                        print("Audio successfully resampled to 8000 Hz.")
+                    except Exception as e:
+                        print(f"Error resampling audio: {e}")
+                        continue
+
                     # Convert audio to mulaw/8000 for Twilio
-                    mulaw_audio = audioop.lin2ulaw(raw_audio, 2)  # Convert PCM to mulaw
+                    try:
+                        mulaw_audio = audioop.lin2ulaw(resampled_audio, 2)  # Convert PCM to mulaw
+                        print("Audio successfully converted to mulaw.")
+                    except Exception as e:
+                        print(f"Error converting PCM to mulaw: {e}")
+                        continue
 
                     # Encode mulaw audio back to Base64
-                    encoded_audio = base64.b64encode(mulaw_audio).decode('utf-8')
+                    try:
+                        encoded_audio = base64.b64encode(mulaw_audio).decode('utf-8')
+                        print("Audio successfully encoded to Base64.")
+                    except Exception as e:
+                        print(f"Error encoding mulaw to Base64: {e}")
+                        continue
 
                     # Construct the Twilio-compatible media message
                     twilio_message = {
@@ -115,11 +133,13 @@ async def handle_web_page(websocket: WebSocket):
                         "streamSid": stream_sid,
                         "media": {"payload": encoded_audio},
                     }
-                    print(f'Sending from browser to twilio:{twilio_message}')
+                    print(f"Sending from browser to Twilio: {twilio_message}")
+
                     # Send the processed audio back to Twilio
-                    for client_id, client_ws in active_connections.items():
+                    # Replace this block with your Twilio WebSocket connection
+                    if "twilio_ws" in globals() and twilio_ws:
                         try:
-                            await client_ws.send_json(twilio_message)
+                            await twilio_ws.send_json(twilio_message)
                             print(f"Forwarded audio to Twilio for Stream SID: {stream_sid}")
                         except Exception as e:
                             print(f"Error forwarding audio to Twilio: {e}")
