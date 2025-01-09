@@ -13,7 +13,11 @@ from langchain_ollama import OllamaLLM
 from gtts import gTTS
 import tempfile
 import subprocess
-
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.templating import Jinja2Templates
+from typing import Dict
+import numpy as np
+from scipy.signal import resample
 
 load_dotenv()
 
@@ -27,7 +31,7 @@ MODEL_PATH = "/home/punith/Desktop/realtime-twilio-outbound/vosk-live-transcript
 OLLAMA_MODEL_NAME = "llama3"  # Update with the desired model
 CL = '\x1b[0K'
 BS = '\x08'
-
+escalation_bool = False
 app = FastAPI()
 vosk_model = Model(MODEL_PATH)
 ollama = OllamaLLM(model=OLLAMA_MODEL_NAME)
@@ -57,6 +61,7 @@ async def handle_outgoing_call(request: Request):
     """Handle outgoing call and return TwiML response to connect to Media Stream."""
     response = VoiceResponse()
     response.say("Please wait while we connect your call to the AI voice assistant...")
+    response.say("Press button zero whenever you want to escalate to human agent")
     response.pause(length=1)
     response.say("O.K. you can start talking!")
     connect = Connect()
@@ -64,23 +69,141 @@ async def handle_outgoing_call(request: Request):
     response.append(connect)
     return HTMLResponse(content=str(response), media_type="application/xml")
 
+# Add CORS for the web page
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Update with your frontend URL for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Keep track of WebSocket connections
+active_connections: Dict[str, WebSocket] = {}
+
+@app.websocket("/web-page")
+async def handle_web_page(websocket: WebSocket):
+    """Handle WebSocket connections from the web page (human agent)."""
+    await websocket.accept()
+    client_id = f"{websocket.client[0]}:{websocket.client[1]}"
+    active_connections[client_id] = websocket
+    print(f"Web page connected: {client_id}")
+
+    try:
+        while True:
+            # Listen for audio responses from the human agent
+            message = await websocket.receive_text()
+
+            try:
+                response_packet = json.loads(message)
+                if response_packet["event"] == "media":
+                    stream_sid = response_packet["streamSid"]
+                    base64_audio = response_packet["payload"]
+
+                    # Decode the Base64 payload to raw audio
+                    raw_audio = base64.b64decode(base64_audio)
+
+                    # Convert audio to mulaw/8000 for Twilio
+                    mulaw_audio = audioop.lin2ulaw(raw_audio, 2)  # Convert PCM to mulaw
+
+                    # Encode mulaw audio back to Base64
+                    encoded_audio = base64.b64encode(mulaw_audio).decode('utf-8')
+
+                    # Construct the Twilio-compatible media message
+                    twilio_message = {
+                        "event": "media",
+                        "streamSid": stream_sid,
+                        "media": {"payload": encoded_audio},
+                    }
+                    print(f'Sending from browser to twilio:{twilio_message}')
+                    # Send the processed audio back to Twilio
+                    for client_id, client_ws in active_connections.items():
+                        try:
+                            await client_ws.send_json(twilio_message)
+                            print(f"Forwarded audio to Twilio for Stream SID: {stream_sid}")
+                        except Exception as e:
+                            print(f"Error forwarding audio to Twilio: {e}")
+            except Exception as e:
+                print(f"Error processing audio from web client {client_id}: {e}")
+
+    except Exception as e:
+        print(f"WebSocket error for web client {client_id}: {e}")
+    finally:
+        active_connections.pop(client_id, None)
+        print(f"Web page disconnected: {client_id}")
+
+templates = Jinja2Templates(directory="templates")
+
+@app.get("/web-page", response_class=HTMLResponse)
+async def web_page(request: Request):
+    """
+    Serve the HTML page dynamically using Jinja2 templates.
+    """
+    websocket_url = f"wss://{request.url.hostname}/web-page"
+    return templates.TemplateResponse(
+        "web_page.html",
+        {"request": request, "websocket_url": websocket_url},
+    )
+
 @app.websocket("/media-stream")
 async def handle_media_stream(websocket: WebSocket):
     """Handle WebSocket connections for media stream."""
+    global escalation_bool
     await websocket.accept()
     print("WebSocket connection accepted.")
     rec = KaldiRecognizer(vosk_model, 16000)
 
     try:
         async for message in websocket.iter_text():
-            print(f"Received message: {message}")
+            # print(f"Received message: {message}")
             packet = json.loads(message)
-
+            audio_file_path = "/tmp/twilio_audio.raw"
             if packet['event'] == 'start':
                 print('Streaming is starting')
             elif packet['event'] == 'stop':
                 print('\nStreaming has stopped')
-            elif packet['event'] == 'media':
+            elif packet['event'] == 'dtmf':
+                # Handle DTMF event directly from the media stream
+                dtmf_digit = packet['dtmf']['digit']
+                print(f"DTMF digit received: {dtmf_digit}")
+
+                if dtmf_digit == "0":
+                    escalation_bool = True
+                    print("User pressed 0. Escalating to human agent...")
+                    for client_id, client_ws in active_connections.items():
+                        try:
+                            await client_ws.send_json({"event": "escalation", "message": "User pressed 0 for escalation"})
+                            print(f"Notified web page: {client_id}")
+                        except Exception as e:
+                            print(f"Error notifying web page {client_id}: {e}")
+            elif escalation_bool == True and packet['event'] == 'media':
+                # Decode audio payload from Twilio and send to web clients
+                payload = packet["media"]["payload"]
+                stream_sid = packet["streamSid"]
+                raw_audio = base64.b64decode(payload)
+
+                # Resample from 8000 Hz to 44100 Hz
+                pcm_audio_np = np.frombuffer(raw_audio, dtype=np.int16)
+                num_samples = int(len(pcm_audio_np) * (44100 / 8000))
+                resampled_audio_np = resample(pcm_audio_np, num_samples).astype(np.int16)
+                resampled_audio = resampled_audio_np.tobytes()
+
+                # Encode resampled PCM audio to Base64
+                resampled_payload = base64.b64encode(resampled_audio).decode('utf-8')
+
+                # Relay audio to human agent
+                for client_id, client_ws in active_connections.items():
+                    try:
+                        await client_ws.send_json({
+                            "event": "media",
+                            "streamSid": stream_sid,
+                            "payload": resampled_payload,
+                        })
+                        print(f"Relayed audio payload to web client {client_id}")
+                    except Exception as e:
+                        print(f"Error relaying audio to web client {client_id}: {e}")
+                    
+            elif escalation_bool  == False and packet['event'] == 'media':
                 print("Processing 'media' event.")
                 # Decode incoming audio
                 try:

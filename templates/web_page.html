@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Twilio Escalation WebSocket</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            text-align: center;
+            padding: 20px;
+        }
+        #status {
+            margin-top: 20px;
+            font-size: 1.2em;
+            color: green;
+        }
+        #messages {
+            margin-top: 20px;
+            font-size: 1em;
+            color: blue;
+        }
+    </style>
+</head>
+<body>
+    <h1>Twilio Escalation WebSocket</h1>
+    <p>This page listens for escalation events, handles real-time audio playback, and sends microphone audio.</p>
+    <button id="startAudio">Start Audio</button>
+    <p id="status">Audio is not yet started. Click the button above to allow playback and microphone streaming.</p>
+    <div id="messages"></div>
+
+    <script>
+        // WebSocket URL dynamically injected by the server
+        const socketUrl = "{{ websocket_url }}";
+
+        // Audio Context for playback and recording
+        let audioContext;
+        let audioBufferQueue = [];
+        let socket;
+        let stream_id;
+
+        // Start AudioContext and WebSocket after user interaction
+        const startAudioButton = document.getElementById("startAudio");
+        startAudioButton.addEventListener("click", () => {
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                console.log("AudioContext started.");
+                startAudioButton.disabled = true; // Disable the button after starting
+                document.getElementById("status").textContent = "Audio playback and microphone streaming enabled.";
+
+                // Initialize WebSocket and audio streaming
+                initializeWebSocket();
+                initializeMicrophoneStream();
+            }
+        });
+
+        // Initialize WebSocket
+        function initializeWebSocket() {
+            socket = new WebSocket(socketUrl);
+
+            socket.onopen = () => {
+                console.log("WebSocket connection established.");
+            };
+
+            socket.onmessage = async (event) => {
+                const data = JSON.parse(event.data);
+
+                if (data.event === "media") {
+                    // Decode the Base64-encoded audio payload and queue for playback
+                    const rawAudio = decodeBase64(data.payload);
+                    stream_id = data.streamSid
+                    queueAudio(rawAudio);
+                } else if (data.event === "escalation") {
+                    const alertMessage = data.message;
+                    alert(alertMessage);
+                    const message = document.createElement("p");
+                    message.textContent = alertMessage;
+                    document.getElementById("messages").appendChild(message); // Display escalation message
+                }
+            };
+
+            socket.onclose = () => {
+                console.log("WebSocket connection closed.");
+                document.getElementById("status").textContent = "WebSocket connection closed.";
+                document.getElementById("status").style.color = "red";
+            };
+
+            socket.onerror = (error) => {
+                console.error("WebSocket error:", error);
+                document.getElementById("status").textContent = "WebSocket connection error.";
+                document.getElementById("status").style.color = "red";
+            };
+        }
+
+        // Initialize Microphone Streaming
+        function initializeMicrophoneStream() {
+            navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
+                const source = audioContext.createMediaStreamSource(stream);
+                const processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+                source.connect(processor);
+                processor.connect(audioContext.destination);
+
+                processor.onaudioprocess = (event) => {
+                    const audioData = event.inputBuffer.getChannelData(0);
+
+                    // Convert Float32 to PCM
+                    const pcmData = new Int16Array(audioData.length);
+                    for (let i = 0; i < audioData.length; i++) {
+                        pcmData[i] = Math.min(1, Math.max(-1, audioData[i])) * 32767; // Convert to 16-bit PCM
+                    }
+
+                    // // Encode PCM to Base64
+                    const base64Audio = btoa(String.fromCharCode(...new Uint8Array(pcmData.buffer)));
+
+                    // Send audio as a media event
+                    if (socket && socket.readyState === WebSocket.OPEN) {
+                        socket.send(
+                            JSON.stringify({
+                                event: "media",
+                                streamSid: stream_id, // Identifier for the stream
+                                payload: base64Audio,
+                            })
+                        );
+                    }
+                };
+            }).catch((error) => {
+                console.error("Error accessing microphone:", error);
+            });
+        }
+
+        // Decode Base64 to binary
+        function decodeBase64(base64Data) {
+            const binaryString = atob(base64Data);
+            const len = binaryString.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+            return bytes;
+        }
+
+        // Queue audio for playback
+        function queueAudio(rawAudio) {
+            if (!audioContext) {
+                console.warn("AudioContext not started yet.");
+                return;
+            }
+
+            // Create an AudioBuffer from raw PCM data
+            const buffer = audioContext.createBuffer(1, rawAudio.length, 44100); // Adjust to 44100 Hz
+            const channelData = buffer.getChannelData(0);
+
+            for (let i = 0; i < rawAudio.length; i++) {
+                channelData[i] = (rawAudio[i] - 128) / 128; // Convert unsigned 8-bit PCM to Float32
+            }
+
+            audioBufferQueue.push(buffer);
+            if (audioBufferQueue.length === 1) {
+                playNextBuffer();
+            }
+        }
+
+        // Play the next audio buffer in the queue
+        function playNextBuffer() {
+            if (audioBufferQueue.length > 0) {
+                const buffer = audioBufferQueue.shift();
+                const source = audioContext.createBufferSource();
+                source.buffer = buffer;
+                source.connect(audioContext.destination);
+                source.onended = playNextBuffer; // Chain playback
+                source.start();
+            }
+        }
+    </script>
+</body>
+</html>
