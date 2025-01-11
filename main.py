@@ -128,21 +128,22 @@ async def handle_web_page(websocket: WebSocket):
                         continue
 
                     # Construct the Twilio-compatible media message
-                    twilio_message = {
-                        "event": "media",
-                        "streamSid": stream_sid,
-                        "media": {"payload": encoded_audio},
-                    }
-                    print(f"Sending from browser to Twilio: {twilio_message}")
 
                     # Send the processed audio back to Twilio
-                    # Replace this block with your Twilio WebSocket connection
-                    if "twilio_ws" in globals() and twilio_ws:
-                        try:
-                            await twilio_ws.send_json(twilio_message)
-                            print(f"Forwarded audio to Twilio for Stream SID: {stream_sid}")
-                        except Exception as e:
-                            print(f"Error forwarding audio to Twilio: {e}")
+                    try:
+                        media_message = {
+                            "event": "media",
+                            "streamSid": stream_sid,
+                            "media": {
+                                "payload": encoded_audio
+                            }
+                        }
+                        print(f"Sending media message: {media_message}")
+                        await websocket.send_json(media_message)
+                        print("Media message sent to Twilio.")
+                    except Exception as e:
+                        print(f"Error sending media message: {e}")
+
             except Exception as e:
                 print(f"Error processing audio from web client {client_id}: {e}")
 
