@@ -81,78 +81,6 @@ app.add_middleware(
 # Keep track of WebSocket connections
 active_connections: Dict[str, WebSocket] = {}
 
-@app.websocket("/web-page")
-async def handle_web_page(websocket: WebSocket):
-    """Handle WebSocket connections from the web page (human agent)."""
-    await websocket.accept()
-    client_id = f"{websocket.client[0]}:{websocket.client[1]}"
-    active_connections[client_id] = websocket
-    print(f"Web page connected: {client_id}")
-
-    try:
-        while True:
-            # Listen for audio responses from the human agent
-            message = await websocket.receive_text()
-
-            try:
-                response_packet = json.loads(message)
-                if response_packet["event"] == "media":
-                    stream_sid = response_packet["streamSid"]
-                    base64_audio = response_packet["payload"]
-
-                    # Decode the Base64 payload to raw PCM audio
-                    raw_audio = base64.b64decode(base64_audio)
-
-                    # Resample the audio to 8000 Hz
-                    try:
-                        resampled_audio = audioop.ratecv(raw_audio, 2, 1, 44100, 8000, None)[0]
-                        print("Audio successfully resampled to 8000 Hz.")
-                    except Exception as e:
-                        print(f"Error resampling audio: {e}")
-                        continue
-
-                    # Convert audio to mulaw/8000 for Twilio
-                    try:
-                        mulaw_audio = audioop.lin2ulaw(resampled_audio, 2)  # Convert PCM to mulaw
-                        print("Audio successfully converted to mulaw.")
-                    except Exception as e:
-                        print(f"Error converting PCM to mulaw: {e}")
-                        continue
-
-                    # Encode mulaw audio back to Base64
-                    try:
-                        encoded_audio = base64.b64encode(mulaw_audio).decode('utf-8')
-                        print("Audio successfully encoded to Base64.")
-                    except Exception as e:
-                        print(f"Error encoding mulaw to Base64: {e}")
-                        continue
-
-                    # Construct the Twilio-compatible media message
-
-                    # Send the processed audio back to Twilio
-                    try:
-                        media_message = {
-                            "event": "media",
-                            "streamSid": stream_sid,
-                            "media": {
-                                "payload": encoded_audio
-                            }
-                        }
-                        print(f"Sending media message: {media_message}")
-                        await websocket.send_json(media_message)
-                        print("Media message sent to Twilio.")
-                    except Exception as e:
-                        print(f"Error sending media message: {e}")
-
-            except Exception as e:
-                print(f"Error processing audio from web client {client_id}: {e}")
-
-    except Exception as e:
-        print(f"WebSocket error for web client {client_id}: {e}")
-    finally:
-        active_connections.pop(client_id, None)
-        print(f"Web page disconnected: {client_id}")
-
 templates = Jinja2Templates(directory="templates")
 
 @app.get("/web-page", response_class=HTMLResponse)
@@ -160,7 +88,7 @@ async def web_page(request: Request):
     """
     Serve the HTML page dynamically using Jinja2 templates.
     """
-    websocket_url = f"wss://{request.url.hostname}/web-page"
+    websocket_url = f"wss://{request.url.hostname}/media-stream"
     return templates.TemplateResponse(
         "web_page.html",
         {"request": request, "websocket_url": websocket_url},
@@ -172,13 +100,15 @@ async def handle_media_stream(websocket: WebSocket):
     global escalation_bool
     await websocket.accept()
     print("WebSocket connection accepted.")
+    client_id = f"{websocket.client[0]}:{websocket.client[1]}"
+    active_connections[client_id] = websocket
+    print(f"Web page connected: {client_id}")
     rec = KaldiRecognizer(vosk_model, 16000)
 
     try:
         async for message in websocket.iter_text():
             # print(f"Received message: {message}")
             packet = json.loads(message)
-            audio_file_path = "/tmp/twilio_audio.raw"
             if packet['event'] == 'start':
                 print('Streaming is starting')
             elif packet['event'] == 'stop':
@@ -223,7 +153,47 @@ async def handle_media_stream(websocket: WebSocket):
                         print(f"Relayed audio payload to web client {client_id}")
                     except Exception as e:
                         print(f"Error relaying audio to web client {client_id}: {e}")
-                    
+
+            elif packet['event'] == 'agent_media':
+                raw_audio = base64.b64decode(packet['media']['payload'])
+                # Resample the audio to 8000 Hz
+                try:
+                    resampled_audio = audioop.ratecv(raw_audio, 2, 1, 44100, 8000, None)[0]
+                    print("Audio successfully resampled to 8000 Hz.")
+                except Exception as e:
+                    print(f"Error resampling audio: {e}")
+                    continue
+
+                # Convert audio to mulaw/8000 for Twilio
+                try:
+                    mulaw_audio = audioop.lin2ulaw(resampled_audio, 2)  # Convert PCM to mulaw
+                    print("Audio successfully converted to mulaw.")
+                except Exception as e:
+                    print(f"Error converting PCM to mulaw: {e}")
+                    continue
+
+                # Encode mulaw audio back to Base64
+                try:
+                    encoded_audio = base64.b64encode(mulaw_audio).decode('utf-8')
+                    print("Audio successfully encoded to Base64.")
+                except Exception as e:
+                    print(f"Error encoding mulaw to Base64: {e}")
+                    continue
+                
+                try:
+                    media_message = {
+                        "event": "media",
+                        "streamSid": packet["streamSid"],
+                        "media": {
+                            "payload": encoded_audio
+                        }
+                    }
+                    print(f"Sending media message: {media_message}")
+                    await websocket.send_json(media_message)
+                    print("Media message sent to Twilio.")
+                except Exception as e:
+                    print(f"Error sending media message: {e}")
+
             elif escalation_bool  == False and packet['event'] == 'media':
                 print("Processing 'media' event.")
                 # Decode incoming audio
